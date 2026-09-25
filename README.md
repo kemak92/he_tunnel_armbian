@@ -11,4 +11,4 @@ Dự án chuyển đổi Home Assistant Add-on (`hass_addon_frp`) thành một *
 Chạy lệnh duy nhất sau trên Terminal của Armbian bằng quyền `root` hoặc `sudo`:
 
 ```bash
-curl -sSL [https://raw.githubusercontent.com/kemak92/he_tunnel_armbian/main/install.sh](https://raw.githubusercontent.com/kemak92/he_tunnel_armbian/main/install.sh) | sudo bash
+curl -fsSL https://raw.githubusercontent.com/kemak92/he_tunnel_armbian/main/install.sh | sudo bash
