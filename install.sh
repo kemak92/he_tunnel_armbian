@@ -1,168 +1,275 @@
-sudo bash -c '
-# 1. Cài đặt các gói phụ thuộc hệ thống
-apt update && apt install -y git nodejs npm
+#!/usr/bin/env bash
+set -euo pipefail
 
-# 2. Xóa thư mục cũ (nếu có) và clone repo từ GitHub
-rm -rf /opt/he_tunnel_frp
-git clone https://github.com/kemak92/hass_addon_frp.git /opt/he_tunnel_frp
-cd /opt/he_tunnel_frp
+# 1. Xác định User thực tế thực thi lệnh (tránh gán nhầm cho root nếu dùng sudo)
+TARGET_USER="${SUDO_USER:-$(id -un)}"
+TARGET_GROUP="$(id -gn "$TARGET_USER")"
+WORK_DIR="/opt/he_tunnel_frp"
 
-# 3. Tạo package.json với các dependency cần thiết
-cat << "EOF" > package.json
+echo "=================================================="
+echo " HE Tunnel FRP Standalone Installer"
+echo " User cài đặt: $TARGET_USER ($TARGET_GROUP)"
+echo " Thư mục: $WORK_DIR"
+echo "=================================================="
+
+# 2. Tạo thư mục và cấp quyền cho User
+sudo mkdir -p "$WORK_DIR"
+sudo chown -R "$TARGET_USER:$TARGET_GROUP" "$WORK_DIR"
+
+# 3. Tải/Khởi tạo các file cấu hình cơ bản (nếu chưa có)
+if [ ! -f "$WORK_DIR/options.json" ]; then
+  cat << 'EOF' > "$WORK_DIR/options.json"
 {
-  "name": "he-tunnel-frp",
-  "version": "1.0.0",
-  "type": "module",
-  "main": "agent.mjs",
-  "dependencies": {
-    "express": "^4.18.2",
-    "ws": "^8.13.0",
-    "yaml": "^2.3.1"
-  }
+  "api_base": "https://heungelectric.com",
+  "email": "user@example.com",
+  "otp": "123456",
+  "subdomain": "mysubdomain",
+  "local_host": "127.0.0.1",
+  "local_port": 8123,
+  "force_reset": false,
+  "agent_enabled": false,
+  "agent_port": 8787,
+  "agent_allow_restart": false
 }
 EOF
+  chown "$TARGET_USER:$TARGET_GROUP" "$WORK_DIR/options.json"
+fi
 
-# 4. Tạo file cấu hình mặc định options.json
-cat << "EOF" > options.json
-{
-  "server_addr": "127.0.0.1",
-  "server_port": 7000,
-  "token": "",
-  "client_id": "armbian_node",
-  "target_ip": "127.0.0.1",
-  "target_port": 80,
-  "log_level": "info"
-}
-EOF
+# 4. Tải/Cập nhật script thực thi run_standalone.sh
+cat << 'EOF' > "$WORK_DIR/run_standalone.sh"
+#!/usr/bin/env bash
+set -euo pipefail
 
-# 5. Tạo file Web UI phục vụ giao diện cấu hình
-cat << "EOF" > web_ui.mjs
-import express from "express";
-import fs from "fs";
-import { exec } from "child_process";
+WORK_DIR="/opt/he_tunnel_frp"
+CONFIG_FILE="$WORK_DIR/options.json"
+DATA_FILE="$WORK_DIR/tunnel_credentials.json"
+DEVICE_FILE="$WORK_DIR/device.json"
+LOG_FILE="$WORK_DIR/he_tunnel_frp.log"
+TMP_FRPC="$WORK_DIR/frpc.toml"
 
-const app = express();
-const PORT = 8080;
-const CONFIG_PATH = "/opt/he_tunnel_frp/options.json";
+mkdir -p "$WORK_DIR"
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+log() { echo "[$(date -Is)] [INFO] $*"; echo "$(date -Is) INFO $*" >> "$LOG_FILE"; }
+err() { echo "[$(date -Is)] [ERROR] $*"; echo "$(date -Is) ERROR $*" >> "$LOG_FILE"; }
 
-app.get("/", (req, res) => {
-  let config = {};
-  if (fs.existsSync(CONFIG_PATH)) {
-    try { config = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8")); } catch(e){}
-  }
-
-  res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <title>FRP Tunnel Config</title>
-      <meta name="viewport" content="width=device-width, initial-scale=1">
-      <style>
-        body { font-family: Arial, sans-serif; margin: 20px; background: #f4f6f9; }
-        .card { max-width: 480px; margin: 0 auto; padding: 20px; background: #fff; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
-        h2 { text-align: center; color: #333; margin-top: 0; }
-        label { font-weight: bold; display: block; margin-top: 12px; font-size: 14px; }
-        input { width: 100%; padding: 8px; margin-top: 4px; box-sizing: border-box; border: 1px solid #ccc; border-radius: 4px; }
-        button { margin-top: 20px; width: 100%; padding: 10px; background: #007bff; color: #fff; border: none; border-radius: 4px; font-size: 16px; cursor: pointer; font-weight: bold; }
-        button:hover { background: #0056b3; }
-      </style>
-    </head>
-    <body>
-      <div class="card">
-        <h2>Cấu hình FRP Tunnel</h2>
-        <form action="/save" method="POST">
-          <label>FRP Server Address:</label>
-          <input type="text" name="server_addr" value="${config.server_addr || ""}" required>
-
-          <label>FRP Server Port:</label>
-          <input type="number" name="server_port" value="${config.server_port || 7000}" required>
-
-          <label>Token / Key:</label>
-          <input type="password" name="token" value="${config.token || ""}">
-
-          <label>Client ID:</label>
-          <input type="text" name="client_id" value="${config.client_id || "armbian_node"}" required>
-
-          <label>Target IP (Local):</label>
-          <input type="text" name="target_ip" value="${config.target_ip || "127.0.0.1"}" required>
-
-          <label>Target Port (Local):</label>
-          <input type="number" name="target_port" value="${config.target_port || 80}" required>
-
-          <button type="submit">Lưu & Khởi động lại Service</button>
-        </form>
-      </div>
-    </body>
-    </html>
-  `);
-});
-
-app.post("/save", (req, res) => {
-  const newConfig = {
-    server_addr: req.body.server_addr,
-    server_port: parseInt(req.body.server_port),
-    token: req.body.token,
-    client_id: req.body.client_id,
-    target_ip: req.body.target_ip,
-    target_port: parseInt(req.body.target_port),
-    log_level: "info"
-  };
-
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(newConfig, null, 2));
-
-  exec("systemctl restart he-tunnel-frp", (error) => {
-    if (error) {
-      return res.send(`<h3>Đã lưu file nhưng lỗi khi restart: ${error.message}</h3><a href="/">Quay lại</a>`);
-    }
-    res.send(`<h3>Lưu thành công! Service đang khởi động lại...</h3><script>setTimeout(() => location.href="/", 3000);</script>`);
-  });
-});
-
-app.listen(PORT, () => {
-  console.log("Web UI running on port " + PORT);
-});
-EOF
-
-# 6. Nhúng Web UI vào file agent.mjs
-if [ -f "agent.mjs" ]; then
-  if ! grep -q "web_ui.mjs" agent.mjs; then
-    sed -i '1s/^/import ".\/web_ui.mjs";\n/' agent.mjs
+# 0. Khởi chạy Web UI port 8080
+if ! pgrep -f "web_ui.mjs" > /dev/null 2>&1; then
+  if [ -f "$WORK_DIR/web_ui.mjs" ]; then
+    log "Đang khởi chạy Web UI port 8080..."
+    node "$WORK_DIR/web_ui.mjs" >> "$LOG_FILE" 2>&1 &
   fi
 fi
 
-# 7. Cài đặt các gói Node.js
-npm install
+redact() { 
+  sed -E 's/(auth\.token[[:space:]]*=[[:space:]]*")[^"]+/\1***REDACTED***/Ig; s/(metadatas\.token[[:space:]]*=[[:space:]]*")[^"]+/\1***REDACTED***/Ig; s/[A-Fa-f0-9]{32,}/***REDACTED***/g; s/[A-Za-z0-9_-]{40,}/***REDACTED***/g'; 
+}
 
-# 8. Tạo systemd service
-cat << "EOF" > /etc/systemd/system/he-tunnel-frp.service
+cfg() {
+  key="$1"
+  default="${2:-}"
+  if [ -f "$CONFIG_FILE" ]; then
+    val=$(jq -r ".$key // empty" "$CONFIG_FILE" 2>/dev/null || true)
+    if [ -n "$val" ] && [ "$val" != "null" ]; then echo "$val"; return; fi
+  fi
+  echo "$default"
+}
+
+# 1. Đọc Cấu hình
+api_base=$(cfg 'api_base' 'https://heungelectric.com')
+email=$(cfg 'email' | tr '[:upper:]' '[:lower:]')
+otp=$(cfg 'otp')
+subdomain=$(cfg 'subdomain' | tr '[:upper:]' '[:lower:]')
+local_host=$(cfg 'local_host' '127.0.0.1')
+local_port=$(cfg 'local_port' '8123')
+force_reset=$(cfg 'force_reset' 'false')
+agent_enabled=$(cfg 'agent_enabled' 'false')
+agent_port=$(cfg 'agent_port' '8787')
+agent_allow_restart=$(cfg 'agent_allow_restart' 'false')
+
+FRPC_BIN="/usr/local/bin/frpc"
+if [ ! -f "$FRPC_BIN" ]; then FRPC_BIN="$WORK_DIR/frpc"; fi
+if [ ! -f "$FRPC_BIN" ]; then err "Không tìm thấy file thực thi frpc"; exit 1; fi
+
+if [ -z "$api_base" ] || [ -z "$email" ] || [ -z "$subdomain" ]; then
+  err "api_base, email và subdomain là bắt buộc trong options.json"
+  exit 1
+fi
+
+# 2. Định danh thiết bị
+if [ ! -f "$DEVICE_FILE" ]; then
+  addon_instance_id=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "standalone-$(date +%s)")
+  addon_client_name=$(hostname)
+  jq -n \
+    --arg client_type "ha_addon" \
+    --arg client_instance_id "$addon_instance_id" \
+    --arg client_name "$addon_client_name" \
+    --arg created_at "$(date -Is)" \
+    '{client_type:$client_type,client_instance_id:$client_instance_id,client_name:$client_name,created_at:$created_at}' > "$DEVICE_FILE"
+fi
+addon_instance_id=$(jq -r '.client_instance_id // ""' "$DEVICE_FILE")
+addon_client_name=$(jq -r '.client_name // ""' "$DEVICE_FILE")
+
+urlenc() { jq -nr --arg v "$1" '$v|@uri'; }
+
+sync_runtime_config() {
+  session_token="$1"
+  [ -z "$session_token" ] && return 1
+  encoded_id=$(urlenc "$addon_instance_id")
+  encoded_name=$(urlenc "$addon_client_name")
+  http_code=$(curl -sS -w '%{http_code}' -o "$WORK_DIR/sync-config.tmp.json" \
+    -H "authorization: Bearer $session_token" \
+    "$api_base/api/v1/addon/sync-config?client_instance_id=$encoded_id&client_name=$encoded_name" || true)
+  log "Sync-config HTTP status $http_code"
+  [ "$http_code" = "200" ] && jq -e '.frpc_toml' "$WORK_DIR/sync-config.tmp.json" >/dev/null
+}
+
+# 3. Đồng bộ & Provision
+needs_provision="true"
+if [ -f "$DATA_FILE" ] && [ "$force_reset" != "true" ]; then
+  cached_email=$(jq -r '.requested.email // ""' "$DATA_FILE" 2>/dev/null || true)
+  cached_subdomain=$(jq -r '.requested.subdomain // ""' "$DATA_FILE" 2>/dev/null || true)
+  cached_session=$(jq -r '.session_token // ""' "$DATA_FILE" 2>/dev/null || true)
+  cached_toml=$(jq -r '.frpc_toml // ""' "$DATA_FILE" 2>/dev/null || true)
+
+  if [ "$cached_email" = "$email" ] && [ "$cached_subdomain" = "$subdomain" ] && [ -n "$cached_toml" ]; then
+    needs_provision="false"
+    log "Thực hiện Sync cấu hình từ Cloud cho subdomain: $subdomain"
+    if sync_runtime_config "$cached_session"; then
+      jq -r '.frpc_toml' "$WORK_DIR/sync-config.tmp.json" > "$TMP_FRPC"
+      jq --arg session_token "$cached_session" --arg email "$email" --arg subdomain "$subdomain" \
+         ' . + {session_token:$session_token,requested:{email:$email,subdomain:$subdomain}}' \
+         "$WORK_DIR/sync-config.tmp.json" > "$DATA_FILE"
+      rm -f "$WORK_DIR/sync-config.tmp.json"
+    else
+      if [ -z "$otp" ]; then err "Sync thất bại và thiếu OTP để provision lại"; exit 1; fi
+      needs_provision="true"
+    fi
+  fi
+fi
+
+if [ "$needs_provision" = "true" ]; then
+  if [ -z "$otp" ]; then err "Cần OTP cho lần kích hoạt đầu tiên hoặc khi force_reset"; exit 1; fi
+  log "Đang gửi yêu cầu Provision Tunnel tới $api_base..."
+  body=$(jq -nc \
+    --arg email "$email" \
+    --arg otp "$otp" \
+    --arg subdomain "$subdomain" \
+    --arg local_host "$local_host" \
+    --arg client_type "ha_addon" \
+    --arg client_instance_id "$addon_instance_id" \
+    --arg client_name "$addon_client_name" \
+    --argjson local_port "$local_port" \
+    --argjson force_reset false \
+    '{email:$email,otp:$otp,subdomain:$subdomain,local_host:$local_host,local_port:$local_port,force_reset:$force_reset,client_type:$client_type,client_instance_id:$client_instance_id,client_name:$client_name}')
+  
+  http_code=$(curl -sS -w '%{http_code}' -o "$WORK_DIR/provision.tmp.json" -X POST "$api_base/api/v1/addon/provision" \
+    -H 'content-type: application/json' --data "$body" || true)
+  
+  log "Provision HTTP status $http_code"
+  if [ "$http_code" != "200" ]; then err "Provision thất bại (HTTP $http_code)"; exit 1; fi
+  
+  provision_session=$(jq -r '.session_token // ""' "$WORK_DIR/provision.tmp.json")
+  if sync_runtime_config "$provision_session"; then
+    jq -r '.frpc_toml' "$WORK_DIR/sync-config.tmp.json" > "$TMP_FRPC"
+    cp "$WORK_DIR/sync-config.tmp.json" "$WORK_DIR/provision.tmp.json"
+    rm -f "$WORK_DIR/sync-config.tmp.json"
+  else
+    jq -r '.frpc_toml' "$WORK_DIR/provision.tmp.json" > "$TMP_FRPC"
+  fi
+  
+  jq --arg session_token "$provision_session" --arg email "$email" --arg subdomain "$subdomain" \
+     '. + {session_token:$session_token,requested:{email:$email,subdomain:$subdomain}}' \
+     "$WORK_DIR/provision.tmp.json" > "$DATA_FILE"
+  rm -f "$WORK_DIR/provision.tmp.json"
+
+  if [ -f "$CONFIG_FILE" ]; then
+    jq '.force_reset = false' "$CONFIG_FILE" > "$WORK_DIR/options.json.tmp" && mv "$WORK_DIR/options.json.tmp" "$CONFIG_FILE"
+  fi
+fi
+
+# 4. Agent & Router
+server_agent_route_enabled=$(jq -r '.runtime.agent_route_enabled // "false"' "$DATA_FILE" 2>/dev/null || echo "false")
+server_agent_key=$(jq -r '.agent_config.verify_public_key_base64 // ""' "$DATA_FILE" 2>/dev/null || echo "")
+
+agent_started="false"
+if [ "$agent_enabled" = "true" ] || [ -n "$server_agent_key" ]; then
+  if command -v node >/dev/null 2>&1 && [ -f "$WORK_DIR/agent.mjs" ]; then
+    log "Đang khởi chạy HE HA Agent trên port $agent_port..."
+    HE_AGENT_HOST="127.0.0.1" \
+    HE_AGENT_PORT="$agent_port" \
+    HE_AGENT_VERIFY_PUBLIC_KEY_BASE64="$server_agent_key" \
+    HE_AGENT_ALLOW_AUTO_RESTART="$agent_allow_restart" \
+    HE_AGENT_CONFIG_DIR="$WORK_DIR" \
+    HE_AGENT_DATA_DIR="$WORK_DIR" \
+      node "$WORK_DIR/agent.mjs" >> "$LOG_FILE" 2>&1 &
+    sleep 1
+    agent_started="true"
+  fi
+fi
+
+if [ "$agent_started" = "true" ] && [ "$server_agent_route_enabled" = "true" ] && [ -f "$WORK_DIR/agent_router.mjs" ]; then
+  server_agent_router_port=$(jq -r '.runtime.agent_router_port // "18080"' "$DATA_FILE")
+  log "Đang khởi chạy HE Agent Router trên port $server_agent_router_port..."
+  HE_AGENT_ROUTER_HOST="127.0.0.1" \
+  HE_AGENT_ROUTER_PORT="$server_agent_router_port" \
+  HE_AGENT_ROUTER_HA_HOST="$local_host" \
+  HE_AGENT_ROUTER_HA_PORT="$local_port" \
+  HE_AGENT_ROUTER_AGENT_HOST="127.0.0.1" \
+  HE_AGENT_ROUTER_AGENT_PORT="$agent_port" \
+  HE_AGENT_ROUTER_PATH_PREFIX="/agent/v1" \
+  HE_AGENT_ROUTER_FORWARDED_PROTO="https" \
+    node "$WORK_DIR/agent_router.mjs" >> "$LOG_FILE" 2>&1 &
+  sleep 1
+  
+  sed -i -E 's/^localIP = ".*"/localIP = "127.0.0.1"/' "$TMP_FRPC"
+  sed -i -E "s/^localPort = [0-9]+/localPort = $server_agent_router_port/" "$TMP_FRPC"
+  log "Agent Router đã kích hoạt; FRPC target đổi thành 127.0.0.1:$server_agent_router_port"
+fi
+
+# 5. Khởi chạy FRPC Loop
+log "Đang bắt đầu tiến trình FRPC..."
+chmod +x "$FRPC_BIN" 2>/dev/null || true
+
+while :; do
+  set +e
+  "$FRPC_BIN" run -c "$TMP_FRPC" 2>&1 | redact | while IFS= read -r line; do
+    echo "[FRPC] $line"
+    echo "$(date -Is) [FRPC] $line" >> "$LOG_FILE"
+  done
+  set -e
+  log "FRPC ngắt kết nối. Đang thử lại sau 5 giây..."
+  sleep 5
+done
+EOF
+
+chmod +x "$WORK_DIR/run_standalone.sh"
+chown -R "$TARGET_USER:$TARGET_GROUP" "$WORK_DIR"
+
+# 5. Tạo Service Systemd cấu hình động theo User
+cat << EOF | sudo tee /etc/systemd/system/he-tunnel-frp.service > /dev/null
 [Unit]
 Description=HE Tunnel FRP Client Standalone Service
-After=network.target network-online.target
-Wants=network-online.target
+After=network.target
 
 [Service]
 Type=simple
-User=root
-WorkingDirectory=/opt/he_tunnel_frp
-ExecStart=/usr/bin/node /opt/he_tunnel_frp/agent.mjs --config /opt/he_tunnel_frp/options.json
+User=$TARGET_USER
+Group=$TARGET_GROUP
+WorkingDirectory=$WORK_DIR
+ExecStart=/bin/bash $WORK_DIR/run_standalone.sh
 Restart=always
-RestartSec=5s
-Environment=NODE_ENV=production
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# 9. Kích hoạt và chạy service
-systemctl daemon-reload
-systemctl enable he-tunnel-frp
-systemctl restart he-tunnel-frp
+# 6. Kích hoạt và khởi động Dịch vụ
+sudo systemctl daemon-reload
+sudo systemctl enable he-tunnel-frp
+sudo systemctl restart he-tunnel-frp
 
-echo "=========================================="
-echo " CÀI ĐẶT THÀNH CÔNG TỪ GITHUB!"
-echo " Mở trình duyệt truy cập Web UI tại: http://$(hostname -I | awk "{print \$1}"):8080"
-echo "=========================================="
-'
+echo "=================================================="
+echo " Cài đặt hoàn tất! Service đã được kích hoạt."
+echo " Kiểm tra log bằng lệnh: sudo journalctl -u he-tunnel-frp -f"
+echo "=================================================="
